@@ -1003,6 +1003,59 @@ feature normalization을 추가해 normalized probe를 재학습했다.
 | `output/stage0_cbox_30views/heldout_renderings_norm_debug/` | fitted mask, negative mask, coefficient component images |
 | `experiments/debug_stage0_alignment.py` | H5/split/mapping alignment diagnostic |
 
+## v0.7 - Stage 0 transport-aware stylization sanity
+
+목표:
+
+```text
+g(I_total) vs g(I_direct) + I_indirect
+```
+
+를 비교해, Stage 0 direct/indirect decomposition만으로 component-wise stylization이 가능한지 확인했다.
+
+사용한 스타일:
+
+| Style | Function |
+| --- | --- |
+| binary_lighting | `1[x>0.5]` |
+| four_level_toon | `floor(4x)/4` |
+| shadow_removal | `x^0.2` |
+| anime_direct_light | luminance threshold `Y>0.5` |
+| hard_toon | thresholds `0.25,0.50,0.75`, levels `0.15,0.45,0.75,1.00` |
+
+산출물:
+
+| 경로 | 역할 |
+| --- | --- |
+| `experiments/stage0_stylization_sanity.py` | stylization sanity script |
+| `output/stage0_stylization/summary_metrics.csv` | heldout 평균 metric |
+| `output/stage0_stylization/binary_lighting/comparison_view_*.png` | representative stress-test sheets |
+| `output/stage0_stylization/*/comparison_view_*.png` | style별 visualization sheets |
+
+평균 결과:
+
+| Style | GT post vs transport PSNR | GT mean diff | Latent PSNR | Material PSNR | Mean PSNR |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| binary_lighting | 12.20 | 0.2970 | 15.57 | 15.14 | 11.47 |
+| four_level_toon | 15.27 | 0.3543 | 17.29 | 17.37 | 14.24 |
+| shadow_removal | 13.58 | 0.3044 | 12.07 | 11.91 | 10.80 |
+| anime_direct_light | 11.24 | 0.3291 | 15.45 | 14.82 | 11.12 |
+| hard_toon | 13.60 | 0.2763 | 17.61 | 17.74 | 13.84 |
+
+성공 조건:
+
+- Condition A: pass. `g(I_total)`과 `g(I_direct)+I_indirect`는 시각적으로 의미 있게 다르다.
+- Condition B: pass. latent transport-aware는 다섯 스타일 모두 mean baseline보다 PSNR이 높다.
+- Condition C: mostly pass. 대표 stress test인 Binary Lighting에서는 latent가 material-only보다 높다. Four-Level/Hard Toon에서는 material-only가 근소하게 높다.
+
+결론:
+
+```text
+현재 Stage 0 decomposition은 transport-aware stylization sanity check를 통과했다.
+대표 기준인 Binary Lighting에서 latent transport-aware reconstruction은 GT_transport를 mean/material보다 잘 복원한다.
+단, full quality는 SH coverage와 per-triangle artifact에 의해 아직 제한된다.
+```
+
 ## v0.7 - interleaved split, fallback metrics, residual probe
 
 ### 변경점

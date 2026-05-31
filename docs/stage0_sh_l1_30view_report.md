@@ -203,6 +203,172 @@ Heldout image-space average:
 
 Feature normalization improves the learned probes, especially indirect coefficient MSE, but material-only still has a small heldout total PSNR edge in this cbox setup.
 
+## Stage 0 Stylization Sanity
+
+### Goal
+
+This sanity check tests whether the Stage 0 direct/indirect decomposition can support transport-aware stylization:
+
+```text
+post-process:      g(I_total)
+transport-aware:   g(I_direct) + I_indirect
+```
+
+No new Blender rendering was used. The experiment reads existing Stage 0 GT and normalized heldout predictions.
+
+### Styles
+
+| Name | Function |
+| --- | --- |
+| binary_lighting | `g(x)=1[x>0.5]` |
+| four_level_toon | `g(x)=floor(4x)/4` |
+| shadow_removal | `g(x)=x^0.2` |
+| anime_direct_light | luminance threshold `Y>0.5`, expanded to RGB |
+| hard_toon | piecewise levels `0.15, 0.45, 0.75, 1.00` |
+
+### Artifacts
+
+| Path | Role |
+| --- | --- |
+| `experiments/stage0_stylization_sanity.py` | stylization sanity script |
+| `output/stage0_stylization/summary_metrics.csv` | averaged metrics |
+| `output/stage0_stylization/binary_lighting/comparison_view_*.png` | binary lighting sheets |
+| `output/stage0_stylization/four_level_toon/comparison_view_*.png` | four-level toon sheets |
+| `output/stage0_stylization/shadow_removal/comparison_view_*.png` | shadow removal sheets |
+| `output/stage0_stylization/anime_direct_light/comparison_view_*.png` | anime direct light sheets |
+| `output/stage0_stylization/hard_toon/comparison_view_*.png` | hard toon sheets |
+| `output/stage0_stylization/*/diff_*_view_*.png` | absolute difference maps |
+
+### Summary Metrics
+
+Average over heldout views `0020`-`0029`.
+
+#### Binary Lighting
+
+```text
+GT Post-process vs GT Transport-aware:
+  PSNR: 12.20
+  SSIM: 0.550
+  Mean Difference: 0.2970
+  Direct Delta: 0.2340
+
+Latent Transport-aware:
+  PSNR: 15.57
+  SSIM: 0.445
+
+Material Transport-aware:
+  PSNR: 15.14
+  SSIM: 0.442
+
+Mean Transport-aware:
+  PSNR: 11.47
+  SSIM: 0.170
+```
+
+#### Four-Level Toon
+
+```text
+GT Post-process vs GT Transport-aware:
+  PSNR: 15.27
+  SSIM: 0.590
+  Mean Difference: 0.3543
+  Direct Delta: 0.0633
+
+Latent Transport-aware:
+  PSNR: 17.29
+  SSIM: 0.449
+
+Material Transport-aware:
+  PSNR: 17.37
+  SSIM: 0.435
+
+Mean Transport-aware:
+  PSNR: 14.24
+  SSIM: 0.209
+```
+
+#### Shadow Removal
+
+```text
+GT Post-process vs GT Transport-aware:
+  PSNR: 13.58
+  SSIM: 0.689
+  Mean Difference: 0.3044
+  Direct Delta: 0.2194
+
+Latent Transport-aware:
+  PSNR: 12.07
+  SSIM: 0.312
+
+Material Transport-aware:
+  PSNR: 11.91
+  SSIM: 0.302
+
+Mean Transport-aware:
+  PSNR: 10.80
+  SSIM: 0.309
+```
+
+#### Anime Direct Light
+
+```text
+GT Post-process vs GT Transport-aware:
+  PSNR: 11.24
+  SSIM: 0.527
+  Mean Difference: 0.3291
+  Direct Delta: 0.2350
+
+Latent Transport-aware:
+  PSNR: 15.45
+  SSIM: 0.439
+
+Material Transport-aware:
+  PSNR: 14.82
+  SSIM: 0.435
+
+Mean Transport-aware:
+  PSNR: 11.12
+  SSIM: 0.167
+```
+
+#### Hard Toon
+
+```text
+GT Post-process vs GT Transport-aware:
+  PSNR: 13.60
+  SSIM: 0.648
+  Mean Difference: 0.2763
+  Direct Delta: 0.2359
+
+Latent Transport-aware:
+  PSNR: 17.61
+  SSIM: 0.569
+
+Material Transport-aware:
+  PSNR: 17.74
+  SSIM: 0.600
+
+Mean Transport-aware:
+  PSNR: 13.84
+  SSIM: 0.427
+```
+
+### Conditions
+
+| Condition | Result |
+| --- | --- |
+| A. `g(I_total)` differs meaningfully from `g(I_direct)+I_indirect` | Pass |
+| B. latent transport-aware beats mean PSNR | Pass for all 5 styles |
+| C. latent is similar to or better than material-only | Pass for binary/anime/shadow; close but lower for four-level/hard toon |
+
+### Conclusion
+
+The current Stage 0 decomposition is sufficient to demonstrate transport-aware stylization as a concept. Applying `g` to the direct component produces visibly and quantitatively different images from applying `g` to the final total image.
+
+Binary Lighting is the representative stress test. In that setting, latent transport-aware reconstruction reaches `15.57 dB` against GT transport, above material-only `15.14 dB` and mean `11.47 dB`.
+
+The learned latent transport reconstruction beats the train-mean baseline for every tested style. It is broadly comparable to material-only, but image quality is still limited by SH target coverage and blocky per-triangle artifacts.
+
 ## v0.7 Debug Pass - Interleaved Split and Fallback Metrics
 
 ### Changes
