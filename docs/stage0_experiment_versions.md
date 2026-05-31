@@ -1071,3 +1071,85 @@ Train mean fallback:
 - material probe를 fitted triangle에서만 학습했기 때문에 모든 unfitted triangle으로 extrapolate하면 coefficient가 폭주할 수 있다. 그래서 clipping이 필요했다.
 - 다음 단계는 SH coverage를 늘리거나, unfitted 영역 전용 fallback 모델을 별도로 학습하는 것이다.
 
+## v0.8 - examples 15 scenes, 60 views
+
+### 목적
+
+SH L=1 coverage 병목을 확인하기 위해 `examples/`의 15개 scene을 60-view orbit으로 확장했다.
+
+camera schedule:
+
+```text
+elevation = 10, 20, 30, 40 degrees
+azimuth count per elevation = 15
+total views = 60
+```
+
+split:
+
+```text
+test views = every 3rd view, indices where view_index % 3 == 0
+train views = the other 40 views
+```
+
+### 산출물
+
+| 경로 | 역할 |
+| --- | --- |
+| `output/stage0_examples_60views/manifest_60views.json` | 15 scene 60-view manifest |
+| `output/stage0_examples_60views/<scene>/<scene>_60views.json` | scene별 60-view config |
+| `output/stage0_examples_60views/<scene>/<scene>_input.h5` | scene별 RenderFormer input H5 |
+| `output/stage0_examples_60views/<scene>/stage0_gt/view_*.npz` | scene별 60개 Stage 0 GT |
+| `output/stage0_examples_60views/<scene>/sh_l1_targets.pt` | train 40-view SH L=1 target |
+| `output/stage0_examples_60views/<scene>/feature_cache/*.pt` | scene당 1개 latent/material feature cache |
+| `output/stage0_examples_60views/sh_l1_coverage_summary.csv` | SH coverage summary |
+
+추가 스크립트:
+
+| 파일 | 역할 |
+| --- | --- |
+| `experiments/prepare_stage0_60views.py` | examples scene을 60-view orbit config로 변환 |
+| `experiments/fit_stage0_sh_l1_from_gt.py` | view별 full latent cache 없이 GT NPZ에서 직접 SH L=1 fitting |
+
+### 실행 결과
+
+15개 scene 모두:
+
+```text
+GT views: 60 / 60
+feature cache: 1 / scene
+SH target: generated
+```
+
+coverage:
+
+| Scene | Fitted triangles | Total triangles | Ratio |
+| --- | ---: | ---: | ---: |
+| cbox-bunny | 478 | 6209 | 0.08 |
+| cbox-lucy | 487 | 11803 | 0.04 |
+| cbox-teapot | 471 | 9397 | 0.05 |
+| cbox | 438 | 5633 | 0.08 |
+| compose-scene | 251 | 7321 | 0.03 |
+| constant-width | 260 | 4527 | 0.06 |
+| crystals | 254 | 1949 | 0.13 |
+| fox-in-the-wild | 296 | 1418 | 0.21 |
+| horse-and-heart | 268 | 5023 | 0.05 |
+| init-template | 506 | 513 | 0.99 |
+| renderformer-logo | 438 | 6386 | 0.07 |
+| room | 576 | 7141 | 0.08 |
+| shader-ball | 515 | 11036 | 0.05 |
+| tree | 384 | 4400 | 0.09 |
+| veach-mis | 202 | 4575 | 0.04 |
+
+### 해석
+
+- 60-view로 늘려도 일반 object scene의 `min_views=6` fitted triangle ratio는 대부분 3-13% 수준이다.
+- `init-template`은 거의 배경/벽/조명만 있는 단순 scene이라 99% coverage가 나온다.
+- `fox-in-the-wild`는 상대적으로 triangle 수가 적고 orbit visibility가 좋아 21%까지 올라간다.
+- cbox 계열은 30-view cbox 396/5633에서 60-view cbox 438/5633으로 소폭 개선에 그쳤다.
+- 단순히 orbit view 수를 늘리는 것보다, surface visibility를 보장하는 camera schedule 또는 per-surface sampling 전략이 필요하다.
+
+주의:
+
+- 처음에는 view별 full feature cache를 저장했지만 900 view에서 디스크가 가득 찼다.
+- 이후 중복 cache를 제거하고, SH target은 GT NPZ에서 직접 fitting하며 feature는 scene당 1개만 저장하는 방식으로 바꿨다.
