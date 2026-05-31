@@ -407,6 +407,18 @@ def save_image_outputs(base_path: str, image: np.ndarray, tonemap: str, exposure
             print(f"[WARN] Failed to save {base_path}.exr: {exc}")
 
 
+def save_diff_image_outputs(base_path: str, diff_image: np.ndarray, scale: float, save_exr: bool):
+    os.makedirs(os.path.dirname(base_path), exist_ok=True)
+    image = np.nan_to_num(diff_image.astype(np.float32) * scale, nan=0.0, posinf=0.0, neginf=0.0)
+    signed_png = np.clip(0.5 + image, 0.0, 1.0)
+    iio.imwrite(base_path + ".png", (signed_png * 255.0 + 0.5).astype(np.uint8))
+    if save_exr:
+        try:
+            iio.imwrite(base_path + ".exr", diff_image.astype(np.float32))
+        except Exception as exc:
+            print(f"[WARN] Failed to save {base_path}.exr: {exc}")
+
+
 def make_contact_sheet(images: list[np.ndarray], labels: list[str], tonemap: str, exposure: float):
     try:
         from PIL import Image, ImageDraw
@@ -789,16 +801,25 @@ def sh_feature_tensor(sample: dict, feature_key: str):
 
 
 class ShDataset(Dataset):
-    def __init__(self, target_path: str, feature_cache_path: str, feature_key: str):
+    def __init__(self, target_path: str, feature_cache_path: str, feature_key: str, normalize: bool = True):
         target = torch.load(target_path, map_location="cpu")
         sample = torch.load(feature_cache_path, map_location="cpu")
+        target_h5 = os.path.normpath(str(target.get("h5_path", "")))
+        sample_h5 = os.path.normpath(str(sample.get("h5_path", "")))
+        if target_h5 and sample_h5 and target_h5 != sample_h5:
+            raise ValueError(f"target/cache H5 mismatch: target={target_h5} cache={sample_h5}")
         tri_ids = target["triangle_id"].long()
         features = sh_feature_tensor(sample, feature_key)
         self.x = features[tri_ids].float()
+        self.feature_mean = self.x.mean(dim=0, keepdim=True)
+        self.feature_std = self.x.std(dim=0, keepdim=True).clamp_min(1e-6)
+        if normalize:
+            self.x = (self.x - self.feature_mean) / self.feature_std
         direct = target["direct_sh_l1"].reshape(tri_ids.shape[0], -1)
         indirect = target["indirect_sh_l1"].reshape(tri_ids.shape[0], -1)
         self.y = torch.cat([direct, indirect], dim=-1).float()
         self.total = target["total_sh_l1"].reshape(tri_ids.shape[0], -1).float()
+        self.h5_path = sample_h5
 
     def __len__(self):
         return self.x.shape[0]
@@ -809,7 +830,7 @@ class ShDataset(Dataset):
 
 def train_sh_probe(args):
     device = torch.device(args.device)
-    dataset = ShDataset(args.target_path, args.feature_cache_path, args.feature_key)
+    dataset = ShDataset(args.target_path, args.feature_cache_path, args.feature_key, normalize=not args.no_feature_norm)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
     model = ShProbe(dataset.x.shape[-1], args.hidden_dim).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -849,8 +870,83 @@ def train_sh_probe(args):
             "model": model.state_dict(),
             "input_dim": dataset.x.shape[-1],
             "feature_key": args.feature_key,
+            "feature_mean": dataset.feature_mean.squeeze(0),
+            "feature_std": dataset.feature_std.squeeze(0),
+            "feature_normalized": not args.no_feature_norm,
+            "h5_path": dataset.h5_path,
             "hidden_dim": args.hidden_dim,
             "output_dim": 24,
+        },
+        args.output_model,
+    )
+    print(f"saved {args.output_model}")
+
+
+def train_sh_residual_probe(args):
+    device = torch.device(args.device)
+    dataset = ShDataset(args.target_path, args.feature_cache_path, args.feature_key, normalize=not args.no_feature_norm)
+    target, _, _, base_direct, base_indirect = predict_sh_coeffs(
+        args.target_path,
+        args.feature_cache_path,
+        args.material_probe_path,
+        device,
+    )
+    base_y = torch.cat(
+        [base_direct.reshape(base_direct.shape[0], -1), base_indirect.reshape(base_indirect.shape[0], -1)],
+        dim=-1,
+    ).float()
+    base_total = (base_direct + base_indirect).reshape(base_direct.shape[0], -1).float()
+    dataset.y = dataset.y - base_y
+    dataset.total = dataset.total - base_total
+
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
+    model = ShProbe(dataset.x.shape[-1], args.hidden_dim).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    for epoch in range(args.epochs):
+        model.train()
+        total_loss = 0.0
+        for x, y, total in loader:
+            x, y, total = x.to(device), y.to(device), total.to(device)
+            pred = model(x)
+            comp_loss = F.smooth_l1_loss(pred, y) if args.loss == "smooth_l1" else F.mse_loss(pred, y)
+            pred_total = pred[:, :12] + pred[:, 12:]
+            sum_loss = F.smooth_l1_loss(pred_total, total) if args.loss == "smooth_l1" else F.mse_loss(pred_total, total)
+            loss = comp_loss + args.lambda_sum * sum_loss
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            total_loss += loss.item() * x.shape[0]
+
+        if (epoch + 1) % args.log_every == 0 or epoch == 0 or epoch + 1 == args.epochs:
+            with torch.no_grad():
+                x = dataset.x.to(device)
+                y = dataset.y.to(device)
+                total = dataset.total.to(device)
+                pred = model(x)
+                direct_mse = F.mse_loss(pred[:, :12], y[:, :12])
+                indirect_mse = F.mse_loss(pred[:, 12:], y[:, 12:])
+                total_mse = F.mse_loss(pred[:, :12] + pred[:, 12:], total)
+            print(
+                f"epoch {epoch + 1:03d} loss={total_loss / len(dataset):.6f} "
+                f"direct_residual_mse={direct_mse:.6f} indirect_residual_mse={indirect_mse:.6f} "
+                f"total_residual_mse={total_mse:.6f}"
+            )
+
+    os.makedirs(os.path.dirname(args.output_model), exist_ok=True)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "input_dim": dataset.x.shape[-1],
+            "feature_key": args.feature_key,
+            "feature_mean": dataset.feature_mean.squeeze(0),
+            "feature_std": dataset.feature_std.squeeze(0),
+            "feature_normalized": not args.no_feature_norm,
+            "h5_path": dataset.h5_path,
+            "hidden_dim": args.hidden_dim,
+            "output_dim": 24,
+            "residual_base_probe_path": args.material_probe_path,
+            "residual_mode": "material_probe",
         },
         args.output_model,
     )
@@ -861,15 +957,52 @@ def predict_sh_coeffs(target_path: str, feature_cache_path: str, probe_path: str
     target = torch.load(target_path, map_location="cpu")
     sample = torch.load(feature_cache_path, map_location="cpu")
     checkpoint = torch.load(probe_path, map_location="cpu")
+    target_h5 = os.path.normpath(str(target.get("h5_path", "")))
+    sample_h5 = os.path.normpath(str(sample.get("h5_path", "")))
+    checkpoint_h5 = os.path.normpath(str(checkpoint.get("h5_path", "")))
+    if target_h5 and sample_h5 and target_h5 != sample_h5:
+        raise ValueError(f"target/cache H5 mismatch: target={target_h5} cache={sample_h5}")
+    if checkpoint_h5 and sample_h5 and checkpoint_h5 != sample_h5:
+        raise ValueError(f"checkpoint/cache H5 mismatch: checkpoint={checkpoint_h5} cache={sample_h5}")
     feature_key = checkpoint["feature_key"]
     features = sh_feature_tensor(sample, feature_key)
     tri_ids = target["triangle_id"].long()
+    pred = predict_sh_tensor_from_checkpoint(features, tri_ids, checkpoint, device)
+    return target, sample, tri_ids, pred[:, :12].reshape(-1, 4, 3), pred[:, 12:].reshape(-1, 4, 3)
+
+
+def predict_sh_tensor_from_checkpoint(features: torch.Tensor, tri_ids: torch.Tensor, checkpoint: dict, device: torch.device):
     model = ShProbe(int(checkpoint["input_dim"]), int(checkpoint.get("hidden_dim", 512))).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     with torch.no_grad():
-        pred = model(features[tri_ids].float().to(device)).cpu()
-    return target, sample, tri_ids, pred[:, :12].reshape(-1, 4, 3), pred[:, 12:].reshape(-1, 4, 3)
+        x = features[tri_ids].float()
+        if checkpoint.get("feature_normalized", False):
+            mean = checkpoint["feature_mean"].float()
+            std = checkpoint["feature_std"].float().clamp_min(1e-6)
+            x = (x - mean) / std
+        return model(x.to(device)).cpu()
+
+
+def predict_sh_coeffs_all(feature_cache_path: str, probe_path: str, device: torch.device):
+    sample = torch.load(feature_cache_path, map_location="cpu")
+    checkpoint = torch.load(probe_path, map_location="cpu")
+    checkpoint_h5 = os.path.normpath(str(checkpoint.get("h5_path", "")))
+    sample_h5 = os.path.normpath(str(sample.get("h5_path", "")))
+    if checkpoint_h5 and sample_h5 and checkpoint_h5 != sample_h5:
+        raise ValueError(f"checkpoint/cache H5 mismatch: checkpoint={checkpoint_h5} cache={sample_h5}")
+    features = sh_feature_tensor(sample, checkpoint["feature_key"])
+    tri_ids = torch.arange(features.shape[0], dtype=torch.long)
+    pred = predict_sh_tensor_from_checkpoint(features, tri_ids, checkpoint, device)
+    return pred[:, :12].reshape(-1, 4, 3), pred[:, 12:].reshape(-1, 4, 3)
+
+
+def clamp_coeffs_to_target_range(coeffs: torch.Tensor, target_coeffs: torch.Tensor, pad_fraction: float):
+    target_coeffs = target_coeffs.float()
+    lo = target_coeffs.amin(dim=0, keepdim=True)
+    hi = target_coeffs.amax(dim=0, keepdim=True)
+    pad = (hi - lo).clamp_min(1e-6) * pad_fraction
+    return coeffs.float().clamp(lo - pad, hi + pad)
 
 
 def sh_metrics(pred_direct, pred_indirect, target):
@@ -914,10 +1047,16 @@ def eval_sh_probes(args):
             print(f"  {key}: {value}")
 
 
-def sh_full_coeffs(target, tri_ids, pred_direct, pred_indirect):
+def sh_full_coeffs(target, tri_ids, pred_direct, pred_indirect, fallback_direct=None, fallback_indirect=None):
     num_triangles = int(target["valid_mask"].shape[0])
-    full_direct = torch.zeros((num_triangles, 4, 3), dtype=torch.float32)
-    full_indirect = torch.zeros((num_triangles, 4, 3), dtype=torch.float32)
+    if fallback_direct is None:
+        full_direct = torch.zeros((num_triangles, 4, 3), dtype=torch.float32)
+    else:
+        full_direct = fallback_direct[:num_triangles].float().clone()
+    if fallback_indirect is None:
+        full_indirect = torch.zeros((num_triangles, 4, 3), dtype=torch.float32)
+    else:
+        full_indirect = fallback_indirect[:num_triangles].float().clone()
     full_direct[tri_ids] = pred_direct.float()
     full_indirect[tri_ids] = pred_indirect.float()
     return full_direct, full_indirect
@@ -936,6 +1075,53 @@ def gather_sh_image(coeffs: torch.Tensor, gt: dict, triangle_centers: torch.Tens
     dirs = F.normalize(camera_pos[None] - triangle_centers[flat_ids].float(), dim=-1)
     values = eval_sh_l1(coeffs[flat_ids].float(), dirs).clamp_min(0.0).numpy().astype(np.float32)
     image[valid] = values
+    return image
+
+
+def gather_fit_mask_image(valid_mask: torch.Tensor, gt: dict):
+    tri_ids = gt["triangle_id_buffer"].astype(np.int64)
+    image = np.zeros((*tri_ids.shape, 3), dtype=np.float32)
+    valid = (tri_ids >= 0) & (tri_ids < int(valid_mask.shape[0]))
+    if np.any(valid):
+        fitted = valid_mask.cpu().numpy().astype(bool)
+        image[valid] = fitted[tri_ids[valid], None].astype(np.float32)
+    return image
+
+
+def gather_scalar_image(values: torch.Tensor, gt: dict):
+    tri_ids = gt["triangle_id_buffer"].astype(np.int64)
+    image = np.zeros((*tri_ids.shape, 3), dtype=np.float32)
+    valid = (tri_ids >= 0) & (tri_ids < int(values.shape[0]))
+    if np.any(valid):
+        scalar = values.cpu().numpy().astype(np.float32)
+        image[valid] = scalar[tri_ids[valid], None]
+    return image
+
+
+def gather_coeff_component_image(coeffs: torch.Tensor, component_index: int, gt: dict):
+    tri_ids = gt["triangle_id_buffer"].astype(np.int64)
+    image = np.zeros((*tri_ids.shape, 3), dtype=np.float32)
+    valid = (tri_ids >= 0) & (tri_ids < coeffs.shape[0])
+    if np.any(valid):
+        values = coeffs[:, component_index].float().numpy()
+        image[valid] = values[tri_ids[valid]]
+    return image
+
+
+def gather_sh_negative_mask(coeffs: torch.Tensor, gt: dict, triangle_centers: torch.Tensor):
+    tri_ids = gt["triangle_id_buffer"].astype(np.int64)
+    image = np.zeros((*tri_ids.shape, 3), dtype=np.float32)
+    valid = (tri_ids >= 0) & (tri_ids < coeffs.shape[0])
+    if not np.any(valid):
+        return image
+
+    c2w = np.asarray(gt["c2w"], dtype=np.float32)
+    camera_pos = torch.from_numpy(c2w[:3, 3]).float()
+    flat_ids = torch.from_numpy(tri_ids[valid]).long()
+    dirs = F.normalize(camera_pos[None] - triangle_centers[flat_ids].float(), dim=-1)
+    raw = eval_sh_l1(coeffs[flat_ids].float(), dirs)
+    neg = (raw < 0.0).any(dim=-1).numpy().astype(np.float32)
+    image[valid] = neg[:, None]
     return image
 
 
@@ -968,8 +1154,39 @@ def eval_heldout_sh(args):
         ("material", args.material_probe_path),
         ("latent_material", args.latent_material_probe_path),
     ]
+    if args.residual_probe_path:
+        probe_specs.append(("material_residual_latent", args.residual_probe_path))
+
+    target_ref = torch.load(args.target_path, map_location="cpu")
+    num_triangles = int(target_ref["valid_mask"].shape[0])
+    fallback_direct = torch.zeros((num_triangles, 4, 3), dtype=torch.float32)
+    fallback_indirect = torch.zeros((num_triangles, 4, 3), dtype=torch.float32)
+    material_base_direct = None
+    material_base_indirect = None
+    if args.unfitted_fallback == "train_sh_mean":
+        fallback_direct = target_ref["direct_sh_l1"].mean(dim=0, keepdim=True).repeat(num_triangles, 1, 1)
+        fallback_indirect = target_ref["indirect_sh_l1"].mean(dim=0, keepdim=True).repeat(num_triangles, 1, 1)
+    elif args.unfitted_fallback == "material":
+        fallback_direct, fallback_indirect = predict_sh_coeffs_all(
+            args.feature_cache_path,
+            args.material_probe_path,
+            device,
+        )
+        fallback_direct = clamp_coeffs_to_target_range(fallback_direct, target_ref["direct_sh_l1"], args.fallback_clip_pad)
+        fallback_indirect = clamp_coeffs_to_target_range(fallback_indirect, target_ref["indirect_sh_l1"], args.fallback_clip_pad)
+        material_base_direct = fallback_direct
+        material_base_indirect = fallback_indirect
+
+    if args.residual_probe_path and material_base_direct is None:
+        material_base_direct, material_base_indirect = predict_sh_coeffs_all(
+            args.feature_cache_path,
+            args.material_probe_path,
+            device,
+        )
+        material_base_direct = clamp_coeffs_to_target_range(material_base_direct, target_ref["direct_sh_l1"], args.fallback_clip_pad)
+        material_base_indirect = clamp_coeffs_to_target_range(material_base_indirect, target_ref["indirect_sh_l1"], args.fallback_clip_pad)
+
     coeffs = {}
-    target_ref = None
     sample_ref = None
     for method, path in probe_specs:
         target, sample, tri_ids, pred_direct, pred_indirect = predict_sh_coeffs(
@@ -978,16 +1195,27 @@ def eval_heldout_sh(args):
             path,
             device,
         )
-        full_direct, full_indirect = sh_full_coeffs(target, tri_ids, pred_direct, pred_indirect)
+        if method == "material_residual_latent":
+            full_direct = fallback_direct[:num_triangles].float().clone()
+            full_indirect = fallback_indirect[:num_triangles].float().clone()
+            full_direct[tri_ids] = material_base_direct[tri_ids].float() + pred_direct.float()
+            full_indirect[tri_ids] = material_base_indirect[tri_ids].float() + pred_indirect.float()
+        else:
+            full_direct, full_indirect = sh_full_coeffs(
+                target,
+                tri_ids,
+                pred_direct,
+                pred_indirect,
+                fallback_direct=fallback_direct,
+                fallback_indirect=fallback_indirect,
+            )
         coeffs[method] = {"direct": full_direct, "indirect": full_indirect}
-        target_ref = target
         sample_ref = sample
 
     if args.mean_coeffs:
-        target = torch.load(args.target_path, map_location="cpu")
+        target = target_ref
         direct_mean = target["direct_sh_l1"].mean(dim=0, keepdim=True)
         indirect_mean = target["indirect_sh_l1"].mean(dim=0, keepdim=True)
-        num_triangles = int(target["valid_mask"].shape[0])
         coeffs["train_sh_mean"] = {
             "direct": direct_mean.repeat(num_triangles, 1, 1),
             "indirect": indirect_mean.repeat(num_triangles, 1, 1),
@@ -1010,6 +1238,14 @@ def eval_heldout_sh(args):
         predictions = {}
         view_dir = os.path.join(args.output_dir, view_name)
         os.makedirs(view_dir, exist_ok=True)
+        tri_ids_img = gt["triangle_id_buffer"].astype(np.int64)
+        valid_tri_pixels = (tri_ids_img >= 0) & (tri_ids_img < num_triangles)
+        fitted_pixels = valid_tri_pixels & target_ref["valid_mask"].bool().cpu().numpy()[tri_ids_img.clip(0, num_triangles - 1)]
+        unfitted_pixels = valid_pixel_mask & ~fitted_pixels
+        fitted_mask = gather_fit_mask_image(target_ref["valid_mask"].bool(), gt)
+        obs_count_image = gather_scalar_image(target_ref["obs_counts"].float(), gt)
+        save_image_outputs(os.path.join(view_dir, "fitted_mask"), fitted_mask, "clip", 1.0, False)
+        save_image_outputs(os.path.join(view_dir, "obs_count"), obs_count_image, "percentile", 1.0, False)
 
         for method, method_coeffs in coeffs.items():
             pred_direct = gather_sh_image(method_coeffs["direct"], gt, triangle_centers)
@@ -1019,15 +1255,49 @@ def eval_heldout_sh(args):
             save_image_outputs(os.path.join(view_dir, f"pred_direct_{method}"), pred_direct, args.tonemap, args.exposure, args.save_exr)
             save_image_outputs(os.path.join(view_dir, f"pred_indirect_{method}"), pred_indirect, args.tonemap, args.exposure, args.save_exr)
             save_image_outputs(os.path.join(view_dir, f"pred_total_{method}"), pred_total, args.tonemap, args.exposure, args.save_exr)
-            mask = torch.from_numpy(valid_pixel_mask)
+            save_diff_image_outputs(os.path.join(view_dir, f"diff5_direct_{method}"), gt_direct - pred_direct, args.diff_scale, args.save_exr)
+            save_diff_image_outputs(os.path.join(view_dir, f"diff5_indirect_{method}"), gt_indirect - pred_indirect, args.diff_scale, args.save_exr)
+            save_diff_image_outputs(os.path.join(view_dir, f"diff5_total_{method}"), gt_total - pred_total, args.diff_scale, args.save_exr)
+            if args.debug_coeff_images:
+                for comp_idx, comp_name in enumerate(["c0", "cx", "cy", "cz"]):
+                    comp_img = gather_coeff_component_image(method_coeffs["indirect"], comp_idx, gt)
+                    save_image_outputs(
+                        os.path.join(view_dir, f"coeff_indirect_{comp_name}_{method}"),
+                        comp_img,
+                        "percentile",
+                        1.0,
+                        args.save_exr,
+                    )
+            neg_direct_img = gather_sh_negative_mask(method_coeffs["direct"], gt, triangle_centers)
+            neg_indirect_img = gather_sh_negative_mask(method_coeffs["indirect"], gt, triangle_centers)
+            neg_total_img = gather_sh_negative_mask(method_coeffs["direct"] + method_coeffs["indirect"], gt, triangle_centers)
+            save_image_outputs(os.path.join(view_dir, f"negative_direct_mask_{method}"), neg_direct_img, "clip", 1.0, False)
+            save_image_outputs(os.path.join(view_dir, f"negative_indirect_mask_{method}"), neg_indirect_img, "clip", 1.0, False)
+            save_image_outputs(os.path.join(view_dir, f"negative_total_mask_{method}"), neg_total_img, "clip", 1.0, False)
             leak = component_leakage_metrics(pred_direct, pred_indirect, gt_direct, gt_indirect, valid_pixel_mask)
+            all_mask = torch.from_numpy(valid_pixel_mask)
+            fitted_mask_t = torch.from_numpy(fitted_pixels)
+            unfitted_mask_t = torch.from_numpy(unfitted_pixels)
+
+            def masked_psnr_np(pred_img, gt_img, mask):
+                if int(mask.sum()) == 0:
+                    return float("nan")
+                return float(psnr(torch.from_numpy(pred_img)[mask], torch.from_numpy(gt_img)[mask]))
+
             metric_rows.append(
                 {
                     "view": view_name,
                     "method": method,
-                    "heldout_direct_psnr": float(psnr(torch.from_numpy(pred_direct)[mask], torch.from_numpy(gt_direct)[mask])),
-                    "heldout_indirect_psnr": float(psnr(torch.from_numpy(pred_indirect)[mask], torch.from_numpy(gt_indirect)[mask])),
-                    "heldout_total_psnr": float(psnr(torch.from_numpy(pred_total)[mask], torch.from_numpy(gt_total)[mask])),
+                    "fitted_pixel_ratio": float(fitted_pixels.sum() / max(1, valid_pixel_mask.sum())),
+                    "heldout_direct_psnr_all": masked_psnr_np(pred_direct, gt_direct, all_mask),
+                    "heldout_indirect_psnr_all": masked_psnr_np(pred_indirect, gt_indirect, all_mask),
+                    "heldout_total_psnr_all": masked_psnr_np(pred_total, gt_total, all_mask),
+                    "heldout_direct_psnr_fitted_pixels_only": masked_psnr_np(pred_direct, gt_direct, fitted_mask_t),
+                    "heldout_indirect_psnr_fitted_pixels_only": masked_psnr_np(pred_indirect, gt_indirect, fitted_mask_t),
+                    "heldout_total_psnr_fitted_pixels_only": masked_psnr_np(pred_total, gt_total, fitted_mask_t),
+                    "heldout_direct_psnr_unfitted_pixels_only": masked_psnr_np(pred_direct, gt_direct, unfitted_mask_t),
+                    "heldout_indirect_psnr_unfitted_pixels_only": masked_psnr_np(pred_indirect, gt_indirect, unfitted_mask_t),
+                    "heldout_total_psnr_unfitted_pixels_only": masked_psnr_np(pred_total, gt_total, unfitted_mask_t),
                     "direct_leakage_margin": leak["direct_leakage_margin_db"],
                     "indirect_leakage_margin": leak["indirect_leakage_margin_db"],
                 }
@@ -1126,7 +1396,26 @@ def main():
     sh_train.add_argument("--lambda_sum", type=float, default=0.5)
     sh_train.add_argument("--loss", choices=["smooth_l1", "mse"], default="smooth_l1")
     sh_train.add_argument("--log_every", type=int, default=25)
+    sh_train.add_argument("--no_feature_norm", action="store_true", help="Disable train-set feature mean/std normalization")
     sh_train.set_defaults(func=train_sh_probe)
+
+    sh_residual = sub.add_parser("train-sh-residual-probe", help="Train latent probe on GT SH residual over a material SH baseline")
+    sh_residual.add_argument("--target_path", required=True)
+    sh_residual.add_argument("--feature_cache_path", required=True)
+    sh_residual.add_argument("--material_probe_path", required=True)
+    sh_residual.add_argument("--feature_key", choices=FEATURE_KEYS + ["latent_material_features"], default="latents")
+    sh_residual.add_argument("--output_model", required=True)
+    sh_residual.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    sh_residual.add_argument("--batch_size", type=int, default=2048)
+    sh_residual.add_argument("--epochs", type=int, default=300)
+    sh_residual.add_argument("--hidden_dim", type=int, default=512)
+    sh_residual.add_argument("--lr", type=float, default=1e-4)
+    sh_residual.add_argument("--weight_decay", type=float, default=1e-4)
+    sh_residual.add_argument("--lambda_sum", type=float, default=0.5)
+    sh_residual.add_argument("--loss", choices=["smooth_l1", "mse"], default="smooth_l1")
+    sh_residual.add_argument("--log_every", type=int, default=25)
+    sh_residual.add_argument("--no_feature_norm", action="store_true", help="Disable train-set feature mean/std normalization")
+    sh_residual.set_defaults(func=train_sh_residual_probe)
 
     sh_eval = sub.add_parser("eval-sh-probes", help="Evaluate SH probes in coefficient space")
     sh_eval.add_argument("--target_path", required=True)
@@ -1145,12 +1434,18 @@ def main():
     heldout.add_argument("--latent_probe_path", required=True)
     heldout.add_argument("--material_probe_path", required=True)
     heldout.add_argument("--latent_material_probe_path", required=True)
+    heldout.add_argument("--residual_probe_path", default=None)
     heldout.add_argument("--output_dir", default="output/stage0_sh_heldout")
     heldout.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     heldout.add_argument("--tonemap", choices=["reinhard", "clip", "percentile"], default="reinhard")
     heldout.add_argument("--exposure", type=float, default=1.0)
     heldout.add_argument("--save_exr", action="store_true")
     heldout.add_argument("--mean_coeffs", action="store_true")
+    heldout.add_argument("--unfitted_fallback", choices=["material", "train_sh_mean", "zero"], default="material")
+    heldout.add_argument("--fallback_clip_pad", type=float, default=0.1, help="Clip material fallback coefficients to train target range plus this fractional pad")
+    heldout.add_argument("--diff_scale", type=float, default=5.0)
+    heldout.add_argument("--debug_masks", action="store_true", help="Save fitted triangle mask images per held-out view")
+    heldout.add_argument("--debug_coeff_images", action="store_true", help="Save c0/cx/cy/cz indirect coefficient images and negative masks")
     heldout.set_defaults(func=eval_heldout_sh)
 
     args = parser.parse_args()

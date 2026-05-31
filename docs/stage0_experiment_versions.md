@@ -972,3 +972,102 @@ heldout image-space total PSNR은 material-only `16.76`, latent+material `16.69`
 - image-space heldout gather에서는 material-only가 total PSNR에서 근소하게 앞선다.
 - valid SH triangle이 396개로 낮아, image-space 평가는 많은 미관측/부정확 triangle과 blocky artifact 영향을 받는다.
 - 다음 단계는 view 수를 더 늘리거나, `min_views=6`을 만족하는 triangle coverage를 늘리는 camera schedule을 다시 잡는 것이다.
+
+### Debug Pass
+
+추가 디버그에서 다음을 확인했다.
+
+- `target_path`와 `feature_cache_path`의 H5는 모두 `output/stage0_cbox_30views/cbox_input.h5`로 일치한다.
+- H5 triangle 배열과 split OBJ triangle 배열은 object별 offset/face count/max diff 기준으로 일치한다.
+- Blender `Object Index -> triangle_id_buffer` mapping도 총 5633개로 H5 triangle 수와 일치한다.
+- heldout `view_0020`은 visible pixel 중 fitted pixel이 66.2%뿐이고, visible unique triangle 1951개 중 fitted visible triangle은 379개다.
+- heldout 전체 평균 fitted pixel ratio는 86.8%지만, unique fitted triangle coverage는 낮다.
+- SH 음수 clamp mask도 존재하지만, 큰 검은 면의 주원인은 fitted coverage 부족이다.
+
+feature normalization을 추가해 normalized probe를 재학습했다.
+
+| Method | coefficient total SH MSE | heldout total PSNR |
+| --- | ---: | ---: |
+| latent norm | 0.00309 | 16.82 |
+| material norm | 0.07238 | 16.92 |
+| latent+material norm | 0.00326 | 16.82 |
+
+산출물:
+
+| 경로 | 역할 |
+| --- | --- |
+| `output/stage0_cbox_30views/probe_latent_to_sh_l1_norm.pt` | normalized latent probe |
+| `output/stage0_cbox_30views/probe_material_to_sh_l1_norm.pt` | normalized material probe |
+| `output/stage0_cbox_30views/probe_latent_material_to_sh_l1_norm.pt` | normalized latent+material probe |
+| `output/stage0_cbox_30views/sh_l1_probe_metrics_norm.csv` | normalized coefficient metrics |
+| `output/stage0_cbox_30views/heldout_renderings_norm_debug/` | fitted mask, negative mask, coefficient component images |
+| `experiments/debug_stage0_alignment.py` | H5/split/mapping alignment diagnostic |
+
+## v0.7 - interleaved split, fallback metrics, residual probe
+
+### 변경점
+
+- heldout 평가에서 unfitted triangle coefficient를 0으로 두지 않고 fallback으로 채우도록 수정했다.
+- 기본 fallback은 material probe prediction이며, material extrapolation 폭주를 막기 위해 train SH target coefficient 범위로 clipping한다.
+- heldout metric을 `all pixels`, `fitted pixels only`, `unfitted pixels only`로 분리했다.
+- 모든 heldout view에 `fitted_mask.png`, `obs_count.png`, `negative_*_mask_*.png`, `(GT - pred) * 5` diff image를 저장한다.
+- view split을 연속 split에서 interleaved split으로 변경했다.
+- material baseline 위에 latent residual을 더하는 `train-sh-residual-probe`를 추가했다.
+
+### Split
+
+```text
+test views  = 0,3,6,9,12,15,18,21,24,27
+train views = 1,2,4,5,7,8,10,11,13,14,16,17,19,20,22,23,25,26,28,29
+```
+
+### 산출물
+
+| 경로 | 역할 |
+| --- | --- |
+| `output/stage0_cbox_30views_interleaved/sh_l1_targets.pt` | interleaved train-only SH target |
+| `output/stage0_cbox_30views_interleaved/probe_latent_to_sh_l1_norm.pt` | normalized latent SH probe |
+| `output/stage0_cbox_30views_interleaved/probe_material_to_sh_l1_norm.pt` | normalized material SH probe |
+| `output/stage0_cbox_30views_interleaved/probe_latent_material_to_sh_l1_norm.pt` | normalized latent+material SH probe |
+| `output/stage0_cbox_30views_interleaved/probe_material_residual_latent_to_sh_l1_norm.pt` | material residual latent probe |
+| `output/stage0_cbox_30views_interleaved/heldout_renderings_material_fallback_clipped_debug/` | material fallback/clipped evaluation images |
+| `output/stage0_cbox_30views_interleaved/heldout_renderings_trainmean_fallback_debug/` | train mean fallback evaluation images |
+| `output/stage0_cbox_30views_interleaved/heldout_view_metrics_material_fallback_clipped.csv` | material fallback metrics |
+| `output/stage0_cbox_30views_interleaved/heldout_view_metrics_trainmean_fallback.csv` | train mean fallback metrics |
+
+### 결과
+
+SH fitting:
+
+| Train views | Fitted triangles | Total triangles |
+| ---: | ---: | ---: |
+| 20 | 407 | 5633 |
+
+Material fallback, clipped:
+
+| Method | total all | total fitted only | total unfitted only |
+| --- | ---: | ---: | ---: |
+| latent | 15.02 | 21.38 | 3.74 |
+| material-only | 15.08 | 20.70 | 3.74 |
+| latent+material | 15.02 | 21.38 | 3.74 |
+| material residual latent | 15.01 | 21.38 | 3.74 |
+| train SH mean | 12.10 | 13.05 | 9.77 |
+
+Train mean fallback:
+
+| Method | total all | total fitted only | total unfitted only |
+| --- | ---: | ---: | ---: |
+| latent | 17.85 | 21.38 | 9.77 |
+| material-only | 17.91 | 20.70 | 9.77 |
+| latent+material | 17.86 | 21.38 | 9.77 |
+| material residual latent | 17.84 | 21.38 | 9.77 |
+| train SH mean | 12.10 | 13.05 | 9.77 |
+
+### 해석
+
+- fitted-only metric에서는 latent 계열이 material-only보다 좋다.
+- all-pixel metric은 fallback 품질에 크게 좌우된다.
+- material fallback은 0 fallback보다 낫지만, unfitted 영역에서는 train SH mean보다 낮다.
+- material probe를 fitted triangle에서만 학습했기 때문에 모든 unfitted triangle으로 extrapolate하면 coefficient가 폭주할 수 있다. 그래서 clipping이 필요했다.
+- 다음 단계는 SH coverage를 늘리거나, unfitted 영역 전용 fallback 모델을 별도로 학습하는 것이다.
+
