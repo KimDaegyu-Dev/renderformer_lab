@@ -167,3 +167,4 @@ checkpoints/
 video-data/
 output/
 tmp/
+.blender_py/

@@ -168,6 +168,36 @@ class RenderFormer(nn.Module, PyTorchModelHubMixin):
 
         return seq, valid_mask, tri_vpos_list
 
+    def extract_view_independent_latents(
+        self,
+        tri_vpos_list,
+        texture_patch_list,
+        valid_mask,
+        vns,
+        include_register_tokens: bool = False,
+    ):
+        """
+        Return the frozen view-independent sequence after triangle-to-triangle transport.
+
+        This is the probing point for experiments that inspect whether per-triangle
+        RenderFormer tokens encode decomposable transport information before the
+        view-dependent ray decoder attends to them.
+        """
+        seq, valid_mask_padded, tri_vpos_list = self.construct_seq(
+            tri_vpos_list,
+            texture_patch_list,
+            valid_mask,
+            vns,
+        )
+        seq = self.transformer(
+            seq,
+            src_key_padding_mask=valid_mask_padded,
+            triangle_pos=tri_vpos_list,
+        )
+        if include_register_tokens:
+            return seq, valid_mask_padded
+        return seq[:, self.skip_token_num:], valid_mask
+
     def forward(self, tri_vpos_list, texture_patch_list, valid_mask, vns, rays_o, rays_d, tri_vpos_view_tf, tf32_view_tf=False):
         """
         Forward pass of the transformer.
